@@ -55,26 +55,39 @@ CACHE_VERSION = "v22-smart-verifier"
 
 _models = {}
 
+@st.cache_resource(show_spinner=False)
+def _load_embed():
+    print("[INIT] Loading Embedding Model ...")
+    return SentenceTransformer(EMBED_MODEL_NAME, device=DEVICE)
+
+@st.cache_resource(show_spinner=False)
+def _load_rerank():
+    print("[INIT] Loading Reranker Model ...")
+    return CrossEncoder(RERANK_MODEL_NAME, device=DEVICE, max_length=384)
+
+@st.cache_resource(show_spinner=False)
+def _load_blip():
+    print("[INIT] Loading Local BLIP ...")
+    processor = BlipProcessor.from_pretrained(CAPTION_MODEL)
+    model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL).to(DEVICE)
+    model.eval()
+    return processor, model
+
 def get_embed_model():
     if "embed" not in _models:
-        print("[INIT] Loading Embedding Model ...")
-        _models["embed"] = SentenceTransformer(EMBED_MODEL_NAME, device=DEVICE)
+        _models["embed"] = _load_embed()
     return _models["embed"]
 
 def get_rerank_model():
     if "rerank" not in _models:
-        print("[INIT] Loading Reranker Model ...")
-        _models["rerank"] = CrossEncoder(RERANK_MODEL_NAME, device=DEVICE, max_length=384)
+        _models["rerank"] = _load_rerank()
     return _models["rerank"]
 
 def get_blip():
     if "blip_processor" not in _models:
-        print("[INIT] Loading Local BLIP ...")
-        processor = BlipProcessor.from_pretrained(CAPTION_MODEL)
-        model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL).to(DEVICE)
-        model.eval()
-        _models["blip_processor"] = processor
-        _models["blip_model"] = model
+        p, m = _load_blip()
+        _models["blip_processor"] = p
+        _models["blip_model"] = m
     return _models["blip_processor"], _models["blip_model"]
 
 def warmup_models():
@@ -1304,29 +1317,57 @@ with st.sidebar:
                 if st.button(q, key=f"faq_{i}", use_container_width=True):
                     ss._pending_query = q
                     st.rerun()
-
 # ----- Main chat area -----
 st.markdown("## 💬 Multimodal PDF Assistant")
 
-for msg in ss.history:
-    role = msg.get("role", "assistant")
-    with st.chat_message(role):
-        st.markdown(msg.get("content", ""), unsafe_allow_html=True)
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 
-# Handle pending query from FAQ click
-pending = ss.pop("_pending_query", None)
-user_input = st.chat_input("Message PDF Assistant...")
-query_to_run = pending or user_input
+def _chat_area():
 
-if query_to_run and query_to_run.strip():
-    with st.chat_message("user"):
-        st.markdown(query_to_run)
-    with st.chat_message("assistant"):
+    # ---- CHAT HISTORY ----
+    chat_container = st.container()
+
+    with chat_container:
+        for msg in ss.history:
+            role = msg.get("role", "assistant")
+            with st.chat_message(role):
+                st.markdown(msg.get("content", ""), unsafe_allow_html=True)
+
+    # ---- FIXED INPUT AREA ----
+    pending = ss.pop("_pending_query", None)
+
+    query = st.chat_input(
+        "Message PDF Assistant...",
+        key="main_chat_input"
+    )
+
+    query_to_run = pending or query
+
+    # ---- PROCESS QUERY ----
+    if query_to_run and query_to_run.strip():
+
+        # add user instantly
+        ss.history.append({
+            "role": "user",
+            "content": query_to_run
+        })
+
         with st.spinner("Thinking..."):
-            new_h, _, _ = chat_handler(
-                query_to_run, ss.history,
-                ss.chunks, ss.images, ss.embs, ss.bm25,
-            )
-        ss.history = new_h
-    st.rerun()
 
+            new_h, _, _ = chat_handler(
+                query_to_run,
+                ss.history[:-1],
+                ss.chunks,
+                ss.images,
+                ss.embs,
+                ss.bm25,
+            )
+
+            ss.history = new_h
+
+        st.rerun()
+
+if _fragment:
+    _chat_area = _fragment(_chat_area)
+
+_chat_area()
