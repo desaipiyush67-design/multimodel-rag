@@ -9,31 +9,19 @@ import concurrent.futures
 import difflib
 from typing import List, Dict
 
-# Gradio schema patch (prevents bool-iter crash on launch)
-try:
-    import gradio_client.utils as _gcu
-    _orig_get_type = _gcu.get_type
-    def _safe_get_type(schema):
-        if not isinstance(schema, dict):
-            return "Any"
-        return _orig_get_type(schema)
-    _gcu.get_type = _safe_get_type
-    _orig_json_schema = _gcu._json_schema_to_python_type
-    def _safe_json_schema(schema, defs=None):
-        if not isinstance(schema, dict):
-            return "Any"
-        try:
-            return _orig_json_schema(schema, defs)
-        except Exception:
-            return "Any"
-    _gcu._json_schema_to_python_type = _safe_json_schema
-except Exception as e:
-    print("[WARN] Gradio patch skipped:", e)
-
 import fitz  # PyMuPDF
 import pdfplumber
-import gradio as gr
+import streamlit as st
 import numpy as np
+
+# Lightweight no-op progress callable used as default for functions
+# that previously accepted gr.Progress(). Streamlit wrapper passes a
+# real callback that updates st.progress.
+class _NoopProgress:
+    def __call__(self, *args, **kwargs):
+        pass
+    def __getattr__(self, _):
+        return self.__call__
 from PIL import Image
 
 import torch
@@ -352,7 +340,7 @@ def extract_vector_visuals_from_page(page, page_no: int, current_concept: str):
 # =============================================================
 # EXTRACTION  (memory-friendly for 300-page PDFs)
 # =============================================================
-def extract_pdf_comprehensive(path: str, progress=gr.Progress()):
+def extract_pdf_comprehensive(path: str, progress=_NoopProgress()):
     all_chunks: List[Dict] = []
     images: List[Dict] = []
     progress(0.05, desc="Opening PDF...")
@@ -1136,7 +1124,7 @@ button.primary, button[variant="primary"] {
 #chatbot img { background: #ffffff !important; border-radius: 10px !important; object-fit: contain !important; }
 """
 
-def process_and_init(file_obj, progress=gr.Progress()):
+def process_and_init(file_obj, progress=_NoopProgress()):
     EMPTY_QS = ["", "", "", "", ""]
     if not file_obj:
         return ("⚠️ No file uploaded", [], [], None, None, "⚠️ Pending", [], *EMPTY_QS)
@@ -1201,100 +1189,144 @@ def load_cached_engine():
             [{"role": "assistant", "content": "👋 **Hello!** Upload a PDF to begin."}],
             *EMPTY_QS)
 
-with gr.Blocks(css=CSS, title="Multimodal PDF Assistant") as demo:
-    st_chunks, st_images, st_embs, st_bm25 = gr.State([]), gr.State([]), gr.State(None), gr.State(None)
+# =============================================================
+# STREAMLIT UI
+# =============================================================
+import tempfile
 
-    with gr.Row():
-        with gr.Column(scale=1, elem_id="sidebar", min_width=280):
-            new_chat_btn = gr.Button("➕ New Chat", variant="secondary")
-            gr.Markdown("### 📄 Document", elem_classes="sidebar-label")
-            pdf_input = gr.File(label="Upload PDF", file_types=[".pdf"], container=False)
-            process_btn = gr.Button("🚀 Process PDF", variant="primary")
-            status_msg = gr.Markdown("Ready.")
-            status_badge = gr.Markdown("")
+class _UploadedShim:
+    """Wraps Streamlit UploadedFile so process_and_init can read .name as a path."""
+    def __init__(self, path):
+        self.name = path
 
-            with gr.Accordion("📖 GUIDE", open=False):
-                gr.Markdown(
-                    "- **Q&A (Stage 2)**: ask 'what/how/why' for precise facts.\n"
-                    "- **Visual (Stage 1)**: mention 'image/diagram/figure' to retrieve a visual.\n"
-                    "- **Concept (Stage 3)**: type a topic for full extraction."
-                )
+class _StProgress:
+    """Bridges legacy progress(value, desc=...) calls to Streamlit progress bar."""
+    def __init__(self, bar, status):
+        self.bar = bar
+        self.status = status
+    def __call__(self, value=0.0, desc=""):
+        try:
+            pct = max(0, min(100, int(float(value) * 100)))
+            self.bar.progress(pct)
+            if desc:
+                self.status.write(desc)
+        except Exception:
+            pass
 
-            with gr.Accordion("❓ FAQ (click a question to ask)", open=False):
-                faq_q1 = gr.Button("", elem_classes="faq-btn", visible=False)
-                faq_q2 = gr.Button("", elem_classes="faq-btn", visible=False)
-                faq_q3 = gr.Button("", elem_classes="faq-btn", visible=False)
-                faq_q4 = gr.Button("", elem_classes="faq-btn", visible=False)
-                faq_q5 = gr.Button("", elem_classes="faq-btn", visible=False)
+st.set_page_config(page_title="Multimodal PDF Assistant", layout="wide", initial_sidebar_state="expanded")
+st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
 
-        with gr.Column(scale=4, elem_id="main-chat"):
-            chatbot = gr.Chatbot(show_label=False, elem_id="chatbot", height=750, type="messages")
-            with gr.Row(elem_id="input-container"):
-                query_box = gr.Textbox(placeholder="Message PDF Assistant...", scale=10, container=False, elem_id="query-box")
-                send_btn = gr.Button("▲", scale=1, elem_id="send-btn")
-
-    state_outputs = [
-        status_msg, st_chunks, st_images, st_embs, st_bm25,
-        status_badge, chatbot,
-        faq_q1, faq_q2, faq_q3, faq_q4, faq_q5
-    ]
-
-    def _wrap_load():
-        result = load_cached_engine()
-        status, chunks, images, embs, bm25, badge, chat, q1, q2, q3, q4, q5 = result
-        return (
-            status, chunks, images, embs, bm25, badge, chat,
-            gr.update(value=q1, visible=bool(q1)),
-            gr.update(value=q2, visible=bool(q2)),
-            gr.update(value=q3, visible=bool(q3)),
-            gr.update(value=q4, visible=bool(q4)),
-            gr.update(value=q5, visible=bool(q5)),
-        )
-
-    def _wrap_process(file_obj, progress=gr.Progress()):
-        result = process_and_init(file_obj, progress)
-        status, chunks, images, embs, bm25, badge, chat, q1, q2, q3, q4, q5 = result
-        return (
-            status, chunks, images, embs, bm25, badge, chat,
-            gr.update(value=q1, visible=bool(q1)),
-            gr.update(value=q2, visible=bool(q2)),
-            gr.update(value=q3, visible=bool(q3)),
-            gr.update(value=q4, visible=bool(q4)),
-            gr.update(value=q5, visible=bool(q5)),
-        )
-
-    new_chat_btn.click(lambda: ([], ""), None, [chatbot, query_box])
-
-    demo.load(_wrap_load, None, state_outputs)
-    process_btn.click(_wrap_process, [pdf_input], state_outputs)
-
-    def run_chat_flow(q, h, chunks, imgs, embs, bm25):
-        if not q or not q.strip():
-            return h, ""
-        new_h, _, _ = chat_handler(q, h, chunks, imgs, embs, bm25)
-        return new_h, ""
-
-    send_btn.click(run_chat_flow, [query_box, chatbot, st_chunks, st_images, st_embs, st_bm25], [chatbot, query_box])
-    query_box.submit(run_chat_flow, [query_box, chatbot, st_chunks, st_images, st_embs, st_bm25], [chatbot, query_box])
-
-    def faq_click(q_text, h, chunks, imgs, embs, bm25):
-        if not q_text or not q_text.strip():
-            return h
-        new_h, _, _ = chat_handler(q_text, h, chunks, imgs, embs, bm25)
-        return new_h
-
-    for btn in [faq_q1, faq_q2, faq_q3, faq_q4, faq_q5]:
-        btn.click(
-            faq_click,
-            [btn, chatbot, st_chunks, st_images, st_embs, st_bm25],
-            [chatbot]
-        )
-
-if __name__ == "__main__":
-    db.init_db()
-    warmup_models()
-    demo.queue()
+# ----- Session state init -----
+ss = st.session_state
+if "initialized" not in ss:
+    ss.initialized = True
+    ss.chunks = []
+    ss.images = []
+    ss.embs = None
+    ss.bm25 = None
+    ss.status = "📤 Upload PDF"
+    ss.badge = "⚠️ Pending"
+    ss.history = []
+    ss.faq = ["", "", "", "", ""]
     try:
-        demo.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True, show_api=False)
-    except TypeError:
-        demo.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True)
+        db.init_db()
+    except Exception:
+        pass
+    try:
+        warmup_models()
+    except Exception:
+        pass
+    # Try cached engine load
+    try:
+        status, chunks, images, embs, bm25, badge, chat, q1, q2, q3, q4, q5 = load_cached_engine()
+        ss.status = status
+        ss.chunks = chunks
+        ss.images = images
+        ss.embs = embs
+        ss.bm25 = bm25
+        ss.badge = badge
+        ss.history = chat
+        ss.faq = [q1, q2, q3, q4, q5]
+    except Exception:
+        pass
+
+# ----- Sidebar -----
+with st.sidebar:
+    if st.button("➕ New Chat", use_container_width=True):
+        ss.history = []
+        st.rerun()
+
+    st.markdown("### 📄 Document")
+    pdf_file = st.file_uploader("Upload PDF", type=["pdf"], label_visibility="collapsed")
+    if st.button("🚀 Process PDF", type="primary", use_container_width=True):
+        if not pdf_file:
+            st.warning("⚠️ No file uploaded")
+        else:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            tmp.write(pdf_file.read())
+            tmp.flush()
+            tmp.close()
+            shim = _UploadedShim(tmp.name)
+            bar = st.progress(0)
+            status_box = st.empty()
+            prog = _StProgress(bar, status_box)
+            try:
+                result = process_and_init(shim, prog)
+                status, chunks, images, embs, bm25, badge, chat, q1, q2, q3, q4, q5 = result
+                ss.status = status
+                ss.chunks = chunks
+                ss.images = images
+                ss.embs = embs
+                ss.bm25 = bm25
+                ss.badge = badge
+                ss.history = chat
+                ss.faq = [q1, q2, q3, q4, q5]
+            finally:
+                try:
+                    os.remove(tmp.name)
+                except Exception:
+                    pass
+            st.rerun()
+
+    st.markdown(ss.status)
+    st.markdown(ss.badge)
+
+    with st.expander("📖 GUIDE", expanded=False):
+        st.markdown(
+            "- **Q&A (Stage 2)**: ask 'what/how/why' for precise facts.\n"
+            "- **Visual (Stage 1)**: mention 'image/diagram/figure' to retrieve a visual.\n"
+            "- **Concept (Stage 3)**: type a topic for full extraction."
+        )
+
+    with st.expander("❓ FAQ (click a question to ask)", expanded=False):
+        for i, q in enumerate(ss.faq):
+            if q:
+                if st.button(q, key=f"faq_{i}", use_container_width=True):
+                    ss._pending_query = q
+                    st.rerun()
+
+# ----- Main chat area -----
+st.markdown("## 💬 Multimodal PDF Assistant")
+
+for msg in ss.history:
+    role = msg.get("role", "assistant")
+    with st.chat_message(role):
+        st.markdown(msg.get("content", ""), unsafe_allow_html=True)
+
+# Handle pending query from FAQ click
+pending = ss.pop("_pending_query", None)
+user_input = st.chat_input("Message PDF Assistant...")
+query_to_run = pending or user_input
+
+if query_to_run and query_to_run.strip():
+    with st.chat_message("user"):
+        st.markdown(query_to_run)
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            new_h, _, _ = chat_handler(
+                query_to_run, ss.history,
+                ss.chunks, ss.images, ss.embs, ss.bm25,
+            )
+        ss.history = new_h
+    st.rerun()
+
