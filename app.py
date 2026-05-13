@@ -1,9 +1,18 @@
 """
-Backend API — Multimodal PDF Assistant
-Run:  uvicorn app:app --host 0.0.0.0 --port 8000
-All PDF parsing / retrieval / LLM logic from the original Streamlit script is
-preserved verbatim. Only the UI layer has been removed; FastAPI endpoints expose
-the same functions to the frontend.
+Backend API — Multimodal PDF Assistant  (Flask version)
+
+Run (dev):    python app.py
+              # serves on http://0.0.0.0:8000
+
+Run (prod):   gunicorn -w 1 -b 0.0.0.0:8000 app:app
+              # IMPORTANT: use 1 worker — ENGINE state and loaded ML models
+              # are kept in-process. Multiple workers would each load their
+              # own copy of the models and would not share the uploaded PDF.
+
+All PDF parsing / retrieval / LLM logic from the FastAPI version is preserved
+verbatim. Only the HTTP layer has been swapped from FastAPI to Flask.
+Endpoints and request/response shapes are identical, so the existing
+Streamlit frontend (frontend.py) works without any change.
 """
 
 import os
@@ -31,9 +40,8 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from transformers import BlipProcessor, BlipForConditionalGeneration
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
 
 import db  # SQLite Logging Module
 
@@ -232,6 +240,7 @@ def table_to_markdown(table: list) -> str:
             row.append("")
         md += "| " + " | ".join(row[:ncols]) + " |\n"
     return md.strip()
+
 
 def pil_to_base64(img: Image.Image, max_px: int = 1200) -> str:
     buf = io.BytesIO()
@@ -1045,19 +1054,18 @@ def _try_load_cache():
 
 
 # =============================================================
-# FASTAPI APP
+# FLASK APP
 # =============================================================
-app = FastAPI(title="Multimodal PDF Assistant API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+# Allow ~200 MB PDF uploads (matches the "300-page PDF" comment above).
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+
+# Permissive CORS — same policy as the FastAPI version.
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 
-@app.on_event("startup")
-def _startup():
+def _run_startup_once():
+    """Replaces FastAPI's @app.on_event('startup')."""
     try:
         db.init_db()
     except Exception:
@@ -1069,36 +1077,44 @@ def _startup():
     _try_load_cache()
 
 
-class ChatRequest(BaseModel):
-    query: str
-    history: Optional[List[Dict]] = None
+# Run startup work exactly once, at import time, so it happens
+# whether the app is launched via `python app.py` or via gunicorn.
+_STARTUP_DONE = False
+if not _STARTUP_DONE:
+    _run_startup_once()
+    _STARTUP_DONE = True
 
 
 @app.get("/status")
 def status():
-    return {
+    return jsonify({
         "status": ENGINE["status"],
         "badge": ENGINE["badge"],
         "n_chunks": len(ENGINE["chunks"]),
         "n_images": len(ENGINE["images"]),
         "faq": ENGINE["faq"],
         "ready": ENGINE["embs"] is not None and len(ENGINE["chunks"]) > 0,
-    }
+    })
 
 
 @app.get("/faq")
 def faq():
-    return {"faq": ENGINE["faq"]}
+    return jsonify({"faq": ENGINE["faq"]})
 
 
 @app.post("/process_pdf")
-async def process_pdf(file: UploadFile = File(...)):
+def process_pdf():
+    if "file" not in request.files:
+        return jsonify({"detail": "No file part named 'file' in the request."}), 400
+    file = request.files["file"]
+    if not file or not file.filename:
+        return jsonify({"detail": "Empty file upload."}), 400
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+        return jsonify({"detail": "Only PDF files are accepted."}), 400
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     try:
-        tmp.write(await file.read())
-        tmp.flush()
+        file.save(tmp.name)
         tmp.close()
         chunks, images, embs, bm25, questions = _build_engine_from_pdf(tmp.name)
         ENGINE["chunks"] = chunks
@@ -1108,19 +1124,19 @@ async def process_pdf(file: UploadFile = File(...)):
         ENGINE["status"] = "✅ Engine Ready"
         ENGINE["badge"] = "✔️ Active"
         ENGINE["faq"] = questions
-        return {
+        return jsonify({
             "status": ENGINE["status"],
             "badge": ENGINE["badge"],
             "n_chunks": len(chunks),
             "n_images": len(images),
             "faq": questions,
             "message": f"✅ **System Initialized!** Indexed {len(chunks)} chunks and {len(images)} visuals.",
-        }
+        })
     except Exception as e:
         traceback.print_exc()
         ENGINE["status"] = f"❌ Error: {e}"
         ENGINE["badge"] = "❌ Error"
-        raise HTTPException(status_code=500, detail=str(e))
+        return jsonify({"detail": str(e)}), 500
     finally:
         try:
             os.remove(tmp.name)
@@ -1129,23 +1145,38 @@ async def process_pdf(file: UploadFile = File(...)):
 
 
 @app.post("/chat")
-def chat(req: ChatRequest):
+def chat():
+    data = request.get_json(silent=True) or {}
+    query = data.get("query")
+    history = data.get("history")
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({"detail": "Field 'query' is required and must be a non-empty string."}), 400
+    if history is not None and not isinstance(history, list):
+        return jsonify({"detail": "Field 'history' must be a list if provided."}), 400
+
     new_history, _, rel_imgs = chat_handler(
-        req.query,
-        req.history or [],
+        query,
+        history or [],
         ENGINE["chunks"],
         ENGINE["images"],
         ENGINE["embs"],
         ENGINE["bm25"],
     )
-    return {"history": new_history, "n_visuals": len(rel_imgs)}
+    return jsonify({"history": new_history, "n_visuals": len(rel_imgs)})
 
 
 @app.post("/reset_chat")
 def reset_chat():
-    return {"ok": True}
+    return jsonify({"ok": True})
+
+
+# Friendly handler for oversize uploads, mirroring FastAPI's 413 behavior.
+@app.errorhandler(413)
+def _too_large(_e):
+    return jsonify({"detail": "Uploaded file is too large."}), 413
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Single-process dev server. For production use gunicorn with -w 1
+    # so the ML models and ENGINE are loaded only once.
+    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
