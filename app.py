@@ -1,3 +1,11 @@
+"""
+Backend API — Multimodal PDF Assistant
+Run:  uvicorn app:app --host 0.0.0.0 --port 8000
+All PDF parsing / retrieval / LLM logic from the original Streamlit script is
+preserved verbatim. Only the UI layer has been removed; FastAPI endpoints expose
+the same functions to the frontend.
+"""
+
 import os
 import re
 import io
@@ -7,21 +15,13 @@ import traceback
 import pickle
 import concurrent.futures
 import difflib
-from typing import List, Dict
+import tempfile
+import uuid
+from typing import List, Dict, Optional
 
 import fitz  # PyMuPDF
 import pdfplumber
-import streamlit as st
 import numpy as np
-
-# Lightweight no-op progress callable used as default for functions
-# that previously accepted gr.Progress(). Streamlit wrapper passes a
-# real callback that updates st.progress.
-class _NoopProgress:
-    def __call__(self, *args, **kwargs):
-        pass
-    def __getattr__(self, _):
-        return self.__call__
 from PIL import Image
 
 import torch
@@ -31,7 +31,20 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from transformers import BlipProcessor, BlipForConditionalGeneration
 
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
 import db  # SQLite Logging Module
+
+
+# Lightweight no-op progress callable (replaces Streamlit progress).
+class _NoopProgress:
+    def __call__(self, *args, **kwargs):
+        pass
+    def __getattr__(self, _):
+        return self.__call__
+
 
 # =============================================================
 # CONFIGURATION — LOCAL OLLAMA  (TUNED FOR LARGE PDFs ~300 pages)
@@ -41,31 +54,27 @@ CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# Retrieval — slightly wider net for big docs
 TOP_K_CHUNKS = 20
 RERANK_TOP_N = 12
 
-# BLIP visual captioning — scaled up for 300-page documents
-MAX_IMAGES_TO_CAPTION = 220          # was 8 — now captions far more diagrams
-CAPTION_WORKERS = 2                  # parallel BLIP workers
-EMBED_BATCH_SIZE = 64                # batched embedding for speed/memory
+MAX_IMAGES_TO_CAPTION = 220
+CAPTION_WORKERS = 2
+EMBED_BATCH_SIZE = 64
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CACHE_VERSION = "v22-smart-verifier"
 
 _models = {}
 
-@st.cache_resource(show_spinner=False)
+
 def _load_embed():
     print("[INIT] Loading Embedding Model ...")
     return SentenceTransformer(EMBED_MODEL_NAME, device=DEVICE)
 
-@st.cache_resource(show_spinner=False)
 def _load_rerank():
     print("[INIT] Loading Reranker Model ...")
     return CrossEncoder(RERANK_MODEL_NAME, device=DEVICE, max_length=384)
 
-@st.cache_resource(show_spinner=False)
 def _load_blip():
     print("[INIT] Loading Local BLIP ...")
     processor = BlipProcessor.from_pretrained(CAPTION_MODEL)
@@ -117,7 +126,6 @@ def ollama_generate(messages, max_tokens=700, temperature=0.0):
 # DYNAMIC FAQ GENERATION
 # =============================================================
 def _parse_faq_questions(raw: str) -> list:
-    """Forgiving parser: extract question-like lines from raw LLM output."""
     questions = []
     question_starters = (
         "what", "how", "where", "why", "when", "who", "which",
@@ -128,7 +136,6 @@ def _parse_faq_questions(raw: str) -> list:
         line = line.strip()
         if not line:
             continue
-        # Strip common prefixes (markdown, numbering, bullets)
         line = re.sub(r"^\*+\s*", "", line)
         line = re.sub(r"^Q\s*\d+[:.\)\-]\s*", "", line, flags=re.I)
         line = re.sub(r"^Question\s*\d+[:.\)\-]\s*", "", line, flags=re.I)
@@ -137,16 +144,13 @@ def _parse_faq_questions(raw: str) -> list:
         line = line.strip("* ").strip()
         if not line:
             continue
-        # Length sanity
         if len(line) < 8 or len(line) > 280:
             continue
-        # Accept if ends with ? OR starts with a question word (auto-add ?)
         if line.endswith("?"):
             questions.append(line)
         else:
             first_word = line.split()[0].lower().strip(".,;:")
             if first_word in question_starters:
-                # Strip trailing punctuation and append ?
                 line = line.rstrip(".!,;:") + "?"
                 questions.append(line)
         if len(questions) == 5:
@@ -155,7 +159,6 @@ def _parse_faq_questions(raw: str) -> list:
 
 
 def generate_pdf_faq_questions(chunks):
-    """Generate 5 FAQ questions. Retries up to 2 times if parser yields too few."""
     try:
         if not chunks:
             return []
@@ -184,9 +187,8 @@ def generate_pdf_faq_questions(chunks):
         )
 
         all_questions = []
-        # Try up to 3 times, accumulating unique questions until we have 5
         for attempt in range(3):
-            temp = 0.4 + attempt * 0.15  # slightly higher temp on retries for diversity
+            temp = 0.4 + attempt * 0.15
             raw = ollama_generate(
                 [{"role": "user", "content": prompt}],
                 max_tokens=500,
@@ -194,7 +196,6 @@ def generate_pdf_faq_questions(chunks):
             )
             parsed = _parse_faq_questions(raw)
             for q in parsed:
-                # Dedupe by lowercased text
                 if q.lower() not in {x.lower() for x in all_questions}:
                     all_questions.append(q)
                 if len(all_questions) == 5:
@@ -233,7 +234,6 @@ def table_to_markdown(table: list) -> str:
     return md.strip()
 
 def pil_to_base64(img: Image.Image, max_px: int = 1200) -> str:
-    """Preserve original image colors; only flatten transparency when present."""
     buf = io.BytesIO()
     has_alpha = (img.mode in ("RGBA", "LA")) or (img.mode == "P" and "transparency" in img.info)
 
@@ -361,10 +361,9 @@ def extract_pdf_comprehensive(path: str, progress=_NoopProgress()):
     current_concept = "Intro/Overview"
     total_pages = len(doc)
 
-    # Per-page caps so a 300-page PDF doesn't explode memory
     MAX_RASTER_IMAGES_PER_PAGE = 8
     MAX_VECTOR_VISUALS_PER_PAGE = 4
-    HARD_IMAGE_CAP = 800  # absolute ceiling across whole doc
+    HARD_IMAGE_CAP = 800
 
     for pn in range(total_pages):
         if pn % 5 == 0 or pn == total_pages - 1:
@@ -414,7 +413,6 @@ def extract_pdf_comprehensive(path: str, progress=_NoopProgress()):
                 "type": "text", "concept": current_concept,
             })
 
-        # ---- IMAGE EXTRACTION (COLOR-CORRECT, capped per page) ----
         page_img_count = 0
         try:
             for img_info in page.get_images(full=True):
@@ -571,22 +569,16 @@ def chat_handler(query, history, chunks, images, embs, bm25):
         return history, "", []
 
     try:
-        # Spelling correction against doc vocab (cap vocab for huge docs)
         doc_vocab = set()
-        # Also build a case-preserving map: lowercase_word -> document_casing
-        # This lets us match user "dewats" → doc "DEWATS" so the reranker sees
-        # the same casing it saw during indexing (reranker IS case-sensitive).
         doc_case_map = {}
         for c in chunks:
             doc_vocab.add(c['concept'].lower())
-            # Preserve original casing of concept words
             for w in re.findall(r'\b[A-Za-z]{3,}\b', c.get('concept', '')):
                 doc_case_map.setdefault(w.lower(), w)
             for word in re.findall(r'\b[a-zA-Z]{3,}\b', c['text'].lower()):
                 doc_vocab.add(word)
                 if len(doc_vocab) > 60000:
                     break
-            # Sample original-case words from text too (for acronym detection)
             for w in re.findall(r'\b[A-Z]{2,}\b', c['text']):
                 doc_case_map.setdefault(w.lower(), w)
             if len(doc_vocab) > 60000:
@@ -596,10 +588,7 @@ def chat_handler(query, history, chunks, images, embs, bm25):
         vocab_list = list(doc_vocab)
         for word in query.lower().split():
             clean_w = word.strip(".,?!;:'\"()[]{}<>")
-            # Don't "correct" words that are already in the doc vocab,
-            # and never correct very short words (avoids 'toilet' -> 'toilets'/junk).
             if clean_w in doc_vocab or len(clean_w) <= 4:
-                # Use document's original casing if this is an acronym/heading word
                 corrected_words.append(doc_case_map.get(clean_w, clean_w))
                 continue
             matches = difflib.get_close_matches(clean_w, vocab_list, n=1, cutoff=0.9)
@@ -690,11 +679,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
         text_scores = reranker.predict(text_pairs)
         scored_chunks = sorted(zip(top_chunks, text_scores), key=lambda x: x[1], reverse=True)
 
-        # ---- TOPIC GUARD ----
-        # Permanently avoid false "No info" when the PDF clearly contains the topic.
-        # This uses (1) exact/fuzzy lexical matching over ALL chunks, (2) phrase matching,
-        # and (3) retrieved reranker matches. It also keeps each new topic independent so
-        # an earlier DEWATS chat cannot contaminate a later Public Toilet request.
         STOP = {"what","is","the","a","an","of","and","in","to","for","with","on","by","at",
                 "are","tell","me","about","please","explain","describe","define","show",
                 "give","do","does","can","you","i","my","our","this","that","these","those",
@@ -708,16 +692,8 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                 key_terms.append(w)
         query_phrase = " ".join(key_terms)
 
-        # ---- STRICT TABLE QUERY DETECTION ----
-        # Prevent generic table/topic requests like "Product specifications" from
-        # receiving unrelated technical tables or model knowledge.
         is_table_query = is_table_like_query
 
-        # ---- GENERIC SPEC QUERY DETECTION ----
-        # If the user asks something like "product specification" or "specs" WITHOUT
-        # naming a specific product (Flowmeter, CPU, etc.), we must NOT blend specs
-        # from different products in a merged PDF. Detect this: key_terms contains
-        # ONLY generic spec/table words and no product anchor.
         generic_spec_words = {
             "product", "products", "specification", "specifications", "spec", "specs",
             "table", "tables", "chart", "charts", "data", "datasheet", "datasheets"
@@ -728,49 +704,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
             and len(key_terms) > 0
             and len(non_generic_terms) == 0
         )
-
-        def table_topic_matches(chunk):
-            if not is_table_query or not key_terms:
-                return True
-
-            concept_l = normalized_text(chunk.get("concept", ""))
-            text_l_raw = str(chunk.get("text", ""))
-            text_l = text_l_raw.lower()
-            blob = normalized_text(f"{chunk.get('concept', '')} {chunk.get('text', '')}")
-
-            # For generic spec queries such as "product specification", require an
-            # exact topic anchor. Without this, merged PDFs can mix random PLC /
-            # sensor / controller specification chunks into the answer.
-            if is_generic_spec_query:
-                exact_anchor = (
-                    re.search(r"\bproduct\s+specifications?\b", concept_l) is not None
-                    or re.search(r"\bproduct\s+specifications?\b", blob[:500]) is not None
-                )
-                has_spec_content = (
-                    chunk.get("type") == "table"
-                    or "parameter" in text_l
-                    or "nominal" in text_l
-                    or re.search(r"\d+\s*(?:mm|kg/cm|bar|°c|˚c|m/s|psi|hz|v|a|w)\b", text_l) is not None
-                )
-                return exact_anchor and has_spec_content
-
-            hits = sum(1 for t in key_terms if re.search(r"\b" + re.escape(t) + r"s?\b", blob))
-            required_hits = max(1, min(len(key_terms), 2))
-            return hits >= required_hits
-
-        def term_variants(term):
-            """Small stemmer for common PDF wording differences: toilet/toilets, bye-law/bye-laws."""
-            variants = {term}
-            if term.endswith("ies") and len(term) > 4:
-                variants.add(term[:-3] + "y")
-            if term.endswith("es") and len(term) > 4:
-                variants.add(term[:-2])
-            if term.endswith("s") and len(term) > 3:
-                variants.add(term[:-1])
-            else:
-                variants.add(term + "s")
-                variants.add(term + "es")
-            return variants
 
         def normalized_text(value):
             value = str(value or "").lower()
@@ -785,6 +718,19 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                 return False
             phrase_re = r"\b" + r"\s+".join(re.escape(t) + r"s?" for t in key_terms) + r"\b"
             return re.search(phrase_re, blob) is not None
+
+        def term_variants(term):
+            variants = {term}
+            if term.endswith("ies") and len(term) > 4:
+                variants.add(term[:-3] + "y")
+            if term.endswith("es") and len(term) > 4:
+                variants.add(term[:-2])
+            if term.endswith("s") and len(term) > 3:
+                variants.add(term[:-1])
+            else:
+                variants.add(term + "s")
+                variants.add(term + "es")
+            return variants
 
         def key_term_hits(chunk):
             if not key_terms:
@@ -816,14 +762,35 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                 score += 1
             return score
 
-        # ---- TABLE QUERY STRICT FILTER ----
-        # For table/specification/terminal/chart questions, only allow chunks whose
-        # text or heading matches the requested table topic before building context.
+        def table_topic_matches(chunk):
+            if not is_table_query or not key_terms:
+                return True
+
+            concept_l = normalized_text(chunk.get("concept", ""))
+            text_l_raw = str(chunk.get("text", ""))
+            text_l = text_l_raw.lower()
+            blob = normalized_text(f"{chunk.get('concept', '')} {chunk.get('text', '')}")
+
+            if is_generic_spec_query:
+                exact_anchor = (
+                    re.search(r"\bproduct\s+specifications?\b", concept_l) is not None
+                    or re.search(r"\bproduct\s+specifications?\b", blob[:500]) is not None
+                )
+                has_spec_content = (
+                    chunk.get("type") == "table"
+                    or "parameter" in text_l
+                    or "nominal" in text_l
+                    or re.search(r"\d+\s*(?:mm|kg/cm|bar|°c|˚c|m/s|psi|hz|v|a|w)\b", text_l) is not None
+                )
+                return exact_anchor and has_spec_content
+
+            hits = sum(1 for t in key_terms if re.search(r"\b" + re.escape(t) + r"s?\b", blob))
+            required_hits = max(1, min(len(key_terms), 2))
+            return hits >= required_hits
+
         if is_table_query:
             scored_chunks = [(c, s) for c, s in scored_chunks if table_topic_matches(c)]
 
-        # Stricter floor for QUESTION mode (factual queries hurt most by drift),
-        # but never let a low reranker score delete a strong exact lexical hit.
         if mode == "STAGE2_QUESTION":
             RERANK_FLOOR = -1.5
             text_min = max(1, len(key_terms) // 2) if key_terms else 0
@@ -844,8 +811,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
 
         filtered = [(c, s) for c, s in scored_chunks if chunk_passes(c, s)]
 
-        # Full-document lexical fallback catches topics that are present in tables/diagrams
-        # but were missed by the first semantic/BM25 top-k list (common with singular/plural terms).
         fallback_chunks = []
         if key_terms:
             fallback_candidates = [(c, lexical_score(c)) for c in chunks]
@@ -861,9 +826,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                     filtered.append((c, 0.0))
                     seen.add(key)
 
-        # Strict fallback: for generic table/spec queries, do not let weak fallback
-        # chunks reach the LLM. If no exact topic-anchored chunks survive, answer
-        # "No info in document" instead of allowing model knowledge to fill gaps.
         if is_table_query:
             filtered = [(c, s) for c, s in filtered if table_topic_matches(c)]
 
@@ -873,7 +835,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
         else:
             final_top_chunks = [c for c, _ in filtered[:max_context]]
 
-        # Visual + table selection: original reranker-based behavior (untouched).
         final_rel_imgs = []
         final_rel_tabs = []
         if not topic_missing:
@@ -906,14 +867,11 @@ def chat_handler(query, history, chunks, images, embs, bm25):
             context_str = "\n\n".join(context_parts)[:char_limit]
 
         messages = [{"role": "system", "content": system_prompt}]
-        # Do not include previous chat turns here. Topic switches like DEWATS -> Public Toilet
-        # must be answered from the current query and current context only.
         messages.append({"role": "user", "content": f"CONTEXT:\n{context_str}\n\nQUESTION: {query}"})
 
         if topic_missing:
             ans = "No info in document."
         else:
-            # Tighter token budget for QUESTION mode; bigger for CONCEPT mode (needs all sections)
             if mode == "STAGE2_QUESTION":
                 llm_max = 450
             elif mode == "STAGE3_GENERAL":
@@ -922,10 +880,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                 llm_max = 700
             ans = ollama_generate(messages, max_tokens=llm_max, temperature=0.0)
 
-            # ---- STRICT TABLE ANSWER GUARD ----
-            # If a table/spec answer contains technical terms that are not present
-            # in the selected context, reject it instead of showing hallucinated
-            # PLC/sensor/controller details.
             if is_table_query and ans and "no info in document" not in ans.lower():
                 context_l_for_guard = context_str.lower()
                 hallucination_markers = [
@@ -941,15 +895,7 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                     print(f"[TABLE GUARD] Rejected hallucinated answer markers: {bad_markers}")
                     ans = "No info in document."
 
-            # ---- NUMBER VERIFIER (QUESTION mode only) ----
-            # Verify any number in the answer appears in the document.
-            # Important: check against ALL chunks that passed the topic guard (not just the
-            # truncated context_str sent to LLM), because a correct number might be in a
-            # chunk that was retrieved but truncated out.
             if mode == "STAGE2_QUESTION" and ans and "no info in document" not in ans.lower():
-                # Build verification corpus: all chunks that passed topic filtering, untruncated.
-                # If the answer cited specific pages, also include any chunk from those pages
-                # — the LLM thought the fact came from there, so check the source.
                 cited_pages = set(re.findall(r"\[Page\s*(\d+)\]", ans, flags=re.I))
                 verify_chunks = list(final_top_chunks)
                 if cited_pages:
@@ -962,14 +908,11 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                 missing_numbers = []
                 for n in answer_numbers:
                     n_low = n.lower()
-                    # Skip page citation numbers like [Page 10]
                     if re.search(r"\[page\s*" + re.escape(n_low) + r"\]", ans, flags=re.I):
                         continue
-                    # Skip figure / table / section / chapter / appendix refs
                     if re.search(r"(?:figure|table|section|chapter|appendix|fig\.?)\s*" + re.escape(n_low),
                                  ans, flags=re.I):
                         continue
-                    # Word-boundary match in verification corpus — "10" must not match "100"
                     if re.search(r"(?<!\d)" + re.escape(n_low) + r"(?!\d)", verify_text):
                         continue
                     missing_numbers.append(n)
@@ -985,8 +928,6 @@ def chat_handler(query, history, chunks, images, embs, bm25):
                         "This may indicate a hallucination. Please rephrase your question "
                         "or check the document directly."
                     )
-
-        # Visual + table evidence was selected before the LLM call and included in context.
 
         tables_md = ""
         if final_rel_tabs:
@@ -1034,213 +975,89 @@ def chat_handler(query, history, chunks, images, embs, bm25):
         history.append({"role": "assistant", "content": msg})
         return history, "", []
 
-# =============================================================
-# UI / CSS
-# =============================================================
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap');
 
-:root {
-  --bg-0: #07090f; --bg-1: #0b1020; --bg-2: #0f172a;
-  --surface: rgba(17, 24, 39, 0.72);
-  --border: rgba(148, 163, 184, 0.16);
-  --border-strong: rgba(148, 163, 184, 0.28);
-  --text: #f1f5f9; --text-dim: #cbd5e1; --muted: #94a3b8;
-  --primary: #6366f1; --primary-2: #8b5cf6; --accent: #22d3ee;
-  --shadow-lg: 0 30px 80px -20px rgba(0,0,0,0.6);
-  --shadow-glow: 0 0 0 1px rgba(99,102,241,0.35), 0 20px 60px -12px rgba(99,102,241,0.45);
-  --radius-lg: 20px;
+# =============================================================
+# ENGINE STATE  (in-process; one PDF loaded at a time)
+# =============================================================
+ENGINE = {
+    "chunks": [],
+    "images": [],
+    "embs": None,
+    "bm25": None,
+    "status": "📤 Upload PDF",
+    "badge": "⚠️ Pending",
+    "faq": ["", "", "", "", ""],
 }
-* { box-sizing: border-box; }
-html, body, .gradio-container {
-  background:
-    radial-gradient(1200px 600px at 10% -10%, rgba(99,102,241,0.18), transparent 60%),
-    radial-gradient(900px 500px at 110% 10%, rgba(34,211,238,0.12), transparent 55%),
-    radial-gradient(800px 600px at 50% 120%, rgba(139,92,246,0.14), transparent 60%),
-    var(--bg-0) !important;
-  color: var(--text) !important;
-  font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
-}
-.gradio-container { max-width: 100% !important; padding: 0 !important; }
-#sidebar {
-  background: linear-gradient(180deg, rgba(11,16,32,0.92), rgba(11,16,32,0.78)) !important;
-  border-right: 1px solid var(--border) !important;
-  padding: 24px 20px !important; min-height: 100vh !important;
-  backdrop-filter: blur(20px) saturate(140%);
-}
-.sidebar-label {
-  color: var(--muted) !important; font-size: 10.5px !important;
-  font-weight: 800 !important; letter-spacing: 0.14em !important;
-  text-transform: uppercase !important; margin: 18px 0 10px !important;
-}
-#main-chat { padding: 28px 32px !important; }
-#chatbot {
-  background: linear-gradient(180deg, rgba(15,23,42,0.6), rgba(15,23,42,0.4)) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: var(--radius-lg) !important;
-  box-shadow: var(--shadow-lg) !important;
-  overflow: hidden !important;
-}
-#chatbot, #chatbot * { color: var(--text) !important; }
-#chatbot .message.user {
-  background: linear-gradient(135deg, var(--primary), var(--primary-2)) !important;
-  color: #fff !important; border-radius: 18px 18px 4px 18px !important;
-}
-#chatbot .message.bot, #chatbot .message.assistant {
-  background: rgba(255,255,255,0.05) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: 18px 18px 18px 4px !important;
-}
-#input-container {
-  background: linear-gradient(180deg, rgba(15,23,42,0.95), rgba(15,23,42,0.85)) !important;
-  border: 1px solid var(--border-strong) !important;
-  border-radius: 22px !important; padding: 10px 10px 10px 18px !important;
-  margin-top: 18px !important;
-}
-#input-container:focus-within {
-  border-color: rgba(99,102,241,0.55) !important;
-  box-shadow: var(--shadow-glow) !important;
-}
-#query-box textarea {
-  background: transparent !important; border: none !important;
-  color: var(--text) !important; font-size: 15px !important; resize: none !important;
-}
-#send-btn {
-  background: linear-gradient(135deg, var(--primary), var(--primary-2)) !important;
-  color: #fff !important; border: none !important;
-  border-radius: 14px !important; height: 44px !important; min-width: 44px !important;
-}
-button { border-radius: 12px !important; font-weight: 700 !important; }
-button.primary, button[variant="primary"] {
-  background: linear-gradient(135deg, var(--primary), var(--primary-2)) !important;
-  color: #fff !important; border: none !important;
-}
-.faq-btn {
-  width: 100% !important; text-align: left !important; white-space: normal !important;
-  padding: 12px 14px !important; margin: 6px 0 !important;
-  background: rgba(99,102,241,0.10) !important;
-  border: 1px solid rgba(99,102,241,0.28) !important;
-  color: var(--text) !important; font-size: 13px !important;
-  line-height: 1.4 !important; border-radius: 12px !important;
-}
-.faq-btn:hover {
-  background: rgba(99,102,241,0.22) !important;
-  border-color: rgba(99,102,241,0.55) !important;
-}
-#chatbot table {
-  background: #ffffff !important; color: #0f172a !important;
-  border-radius: 12px !important; border-collapse: separate !important;
-  border-spacing: 0 !important; margin: 10px 0 !important;
-}
-#chatbot table * { color: #0f172a !important; }
-#chatbot th, #chatbot td { padding: 10px 12px !important; border-bottom: 1px solid #e2e8f0 !important; }
-#chatbot img { background: #ffffff !important; border-radius: 10px !important; object-fit: contain !important; }
-"""
 
-def process_and_init(file_obj, progress=_NoopProgress()):
-    EMPTY_QS = ["", "", "", "", ""]
-    if not file_obj:
-        return ("⚠️ No file uploaded", [], [], None, None, "⚠️ Pending", [], *EMPTY_QS)
+
+def _build_engine_from_pdf(path: str, progress=_NoopProgress()):
+    chunks, images = extract_pdf_comprehensive(path, progress)
+    progress(0.92, desc="Building search index...")
+    model = get_embed_model()
+    texts = [c["text"] for c in chunks]
+    embs = model.encode(
+        texts,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        batch_size=EMBED_BATCH_SIZE,
+    ).astype("float32")
+    bm25 = BM25Okapi([t.lower().split() for t in texts])
     try:
-        chunks, images = extract_pdf_comprehensive(file_obj.name, progress)
-        progress(0.92, desc="Building search index...")
-        model = get_embed_model()
-        texts = [c["text"] for c in chunks]
-        # Batched encoding — keeps memory predictable on big PDFs
-        embs = model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=EMBED_BATCH_SIZE,
-        ).astype("float32")
-        bm25 = BM25Okapi([t.lower().split() for t in texts])
-        try:
-            with open("engine_cache.pkl", "wb") as f:
-                pickle.dump({
-                    "version": CACHE_VERSION,
-                    "chunks": chunks, "images": images, "embs": embs, "bm25": bm25
-                }, f)
-        except Exception:
-            pass
+        with open("engine_cache.pkl", "wb") as f:
+            pickle.dump({
+                "version": CACHE_VERSION,
+                "chunks": chunks, "images": images, "embs": embs, "bm25": bm25
+            }, f)
+    except Exception:
+        pass
 
-        questions = generate_pdf_faq_questions(chunks)
+    questions = generate_pdf_faq_questions(chunks)
+    while len(questions) < 5:
+        questions.append("")
+    return chunks, images, embs, bm25, questions[:5]
+
+
+def _try_load_cache():
+    if not os.path.exists("engine_cache.pkl"):
+        return False
+    try:
+        with open("engine_cache.pkl", "rb") as f:
+            d = pickle.load(f)
+        if d.get("version") != CACHE_VERSION:
+            try:
+                os.remove("engine_cache.pkl")
+            except Exception:
+                pass
+            return False
+        ENGINE["chunks"] = d["chunks"]
+        ENGINE["images"] = d["images"]
+        ENGINE["embs"] = d["embs"]
+        ENGINE["bm25"] = d["bm25"]
+        ENGINE["status"] = "✅ Engine Ready (Cached)"
+        ENGINE["badge"] = "✔️ Active"
+        questions = generate_pdf_faq_questions(d["chunks"])
         while len(questions) < 5:
             questions.append("")
-        questions = questions[:5]
+        ENGINE["faq"] = questions[:5]
+        return True
+    except Exception:
+        return False
 
-        return ("✅ Engine Ready", chunks, images, embs, bm25, "✔️ Active",
-                [{"role": "assistant", "content": f"✅ **System Initialized!** Indexed {len(chunks)} chunks and {len(images)} visuals. Ask about text, tables, or diagrams."}],
-                *questions)
-    except Exception as e:
-        traceback.print_exc()
-        return (f"❌ Error: {str(e)}", [], [], None, None, "❌ Error",
-                [{"role": "assistant", "content": f"❌ Error: {str(e)}"}],
-                *EMPTY_QS)
-
-def load_cached_engine():
-    EMPTY_QS = ["", "", "", "", ""]
-    if os.path.exists("engine_cache.pkl"):
-        try:
-            with open("engine_cache.pkl", "rb") as f:
-                d = pickle.load(f)
-            if d.get("version") != CACHE_VERSION:
-                try:
-                    os.remove("engine_cache.pkl")
-                except Exception:
-                    pass
-            else:
-                questions = generate_pdf_faq_questions(d["chunks"])
-                while len(questions) < 5:
-                    questions.append("")
-                questions = questions[:5]
-                return ("✅ Engine Ready (Cached)", d["chunks"], d["images"], d["embs"], d["bm25"], "✔️ Active",
-                        [{"role": "assistant", "content": "👋 **Welcome back!** Ready to analyze your document."}],
-                        *questions)
-        except Exception:
-            pass
-    return ("📤 Upload PDF", [], [], None, None, "⚠️ Pending",
-            [{"role": "assistant", "content": "👋 **Hello!** Upload a PDF to begin."}],
-            *EMPTY_QS)
 
 # =============================================================
-# STREAMLIT UI
+# FASTAPI APP
 # =============================================================
-import tempfile
+app = FastAPI(title="Multimodal PDF Assistant API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class _UploadedShim:
-    """Wraps Streamlit UploadedFile so process_and_init can read .name as a path."""
-    def __init__(self, path):
-        self.name = path
 
-class _StProgress:
-    """Bridges legacy progress(value, desc=...) calls to Streamlit progress bar."""
-    def __init__(self, bar, status):
-        self.bar = bar
-        self.status = status
-    def __call__(self, value=0.0, desc=""):
-        try:
-            pct = max(0, min(100, int(float(value) * 100)))
-            self.bar.progress(pct)
-            if desc:
-                self.status.write(desc)
-        except Exception:
-            pass
-
-st.set_page_config(page_title="Multimodal PDF Assistant", layout="wide", initial_sidebar_state="expanded")
-st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
-
-# ----- Session state init -----
-ss = st.session_state
-if "initialized" not in ss:
-    ss.initialized = True
-    ss.chunks = []
-    ss.images = []
-    ss.embs = None
-    ss.bm25 = None
-    ss.status = "📤 Upload PDF"
-    ss.badge = "⚠️ Pending"
-    ss.history = []
-    ss.faq = ["", "", "", "", ""]
+@app.on_event("startup")
+def _startup():
     try:
         db.init_db()
     except Exception:
@@ -1249,125 +1066,86 @@ if "initialized" not in ss:
         warmup_models()
     except Exception:
         pass
-    # Try cached engine load
+    _try_load_cache()
+
+
+class ChatRequest(BaseModel):
+    query: str
+    history: Optional[List[Dict]] = None
+
+
+@app.get("/status")
+def status():
+    return {
+        "status": ENGINE["status"],
+        "badge": ENGINE["badge"],
+        "n_chunks": len(ENGINE["chunks"]),
+        "n_images": len(ENGINE["images"]),
+        "faq": ENGINE["faq"],
+        "ready": ENGINE["embs"] is not None and len(ENGINE["chunks"]) > 0,
+    }
+
+
+@app.get("/faq")
+def faq():
+    return {"faq": ENGINE["faq"]}
+
+
+@app.post("/process_pdf")
+async def process_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     try:
-        status, chunks, images, embs, bm25, badge, chat, q1, q2, q3, q4, q5 = load_cached_engine()
-        ss.status = status
-        ss.chunks = chunks
-        ss.images = images
-        ss.embs = embs
-        ss.bm25 = bm25
-        ss.badge = badge
-        ss.history = chat
-        ss.faq = [q1, q2, q3, q4, q5]
-    except Exception:
-        pass
+        tmp.write(await file.read())
+        tmp.flush()
+        tmp.close()
+        chunks, images, embs, bm25, questions = _build_engine_from_pdf(tmp.name)
+        ENGINE["chunks"] = chunks
+        ENGINE["images"] = images
+        ENGINE["embs"] = embs
+        ENGINE["bm25"] = bm25
+        ENGINE["status"] = "✅ Engine Ready"
+        ENGINE["badge"] = "✔️ Active"
+        ENGINE["faq"] = questions
+        return {
+            "status": ENGINE["status"],
+            "badge": ENGINE["badge"],
+            "n_chunks": len(chunks),
+            "n_images": len(images),
+            "faq": questions,
+            "message": f"✅ **System Initialized!** Indexed {len(chunks)} chunks and {len(images)} visuals.",
+        }
+    except Exception as e:
+        traceback.print_exc()
+        ENGINE["status"] = f"❌ Error: {e}"
+        ENGINE["badge"] = "❌ Error"
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
 
-# ----- Sidebar -----
-with st.sidebar:
-    if st.button("➕ New Chat", use_container_width=True):
-        ss.history = []
-        st.rerun()
 
-    st.markdown("### 📄 Document")
-    pdf_file = st.file_uploader("Upload PDF", type=["pdf"], label_visibility="collapsed")
-    if st.button("🚀 Process PDF", type="primary", use_container_width=True):
-        if not pdf_file:
-            st.warning("⚠️ No file uploaded")
-        else:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            tmp.write(pdf_file.read())
-            tmp.flush()
-            tmp.close()
-            shim = _UploadedShim(tmp.name)
-            bar = st.progress(0)
-            status_box = st.empty()
-            prog = _StProgress(bar, status_box)
-            try:
-                result = process_and_init(shim, prog)
-                status, chunks, images, embs, bm25, badge, chat, q1, q2, q3, q4, q5 = result
-                ss.status = status
-                ss.chunks = chunks
-                ss.images = images
-                ss.embs = embs
-                ss.bm25 = bm25
-                ss.badge = badge
-                ss.history = chat
-                ss.faq = [q1, q2, q3, q4, q5]
-            finally:
-                try:
-                    os.remove(tmp.name)
-                except Exception:
-                    pass
-            st.rerun()
-
-    st.markdown(ss.status)
-    st.markdown(ss.badge)
-
-    with st.expander("📖 GUIDE", expanded=False):
-        st.markdown(
-            "- **Q&A (Stage 2)**: ask 'what/how/why' for precise facts.\n"
-            "- **Visual (Stage 1)**: mention 'image/diagram/figure' to retrieve a visual.\n"
-            "- **Concept (Stage 3)**: type a topic for full extraction."
-        )
-
-    with st.expander("❓ FAQ (click a question to ask)", expanded=False):
-        for i, q in enumerate(ss.faq):
-            if q:
-                if st.button(q, key=f"faq_{i}", use_container_width=True):
-                    ss._pending_query = q
-                    st.rerun()
-# ----- Main chat area -----
-st.markdown("## 💬 Multimodal PDF Assistant")
-
-_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
-
-def _chat_area():
-
-    # ---- CHAT HISTORY ----
-    chat_container = st.container()
-
-    with chat_container:
-        for msg in ss.history:
-            role = msg.get("role", "assistant")
-            with st.chat_message(role):
-                st.markdown(msg.get("content", ""), unsafe_allow_html=True)
-
-    # ---- FIXED INPUT AREA ----
-    pending = ss.pop("_pending_query", None)
-
-    query = st.chat_input(
-        "Message PDF Assistant...",
-        key="main_chat_input"
+@app.post("/chat")
+def chat(req: ChatRequest):
+    new_history, _, rel_imgs = chat_handler(
+        req.query,
+        req.history or [],
+        ENGINE["chunks"],
+        ENGINE["images"],
+        ENGINE["embs"],
+        ENGINE["bm25"],
     )
+    return {"history": new_history, "n_visuals": len(rel_imgs)}
 
-    query_to_run = pending or query
 
-    # ---- PROCESS QUERY ----
-    if query_to_run and query_to_run.strip():
+@app.post("/reset_chat")
+def reset_chat():
+    return {"ok": True}
 
-        # add user instantly
-        ss.history.append({
-            "role": "user",
-            "content": query_to_run
-        })
 
-        with st.spinner("Thinking..."):
-
-            new_h, _, _ = chat_handler(
-                query_to_run,
-                ss.history[:-1],
-                ss.chunks,
-                ss.images,
-                ss.embs,
-                ss.bm25,
-            )
-
-            ss.history = new_h
-
-        st.rerun()
-
-if _fragment:
-    _chat_area = _fragment(_chat_area)
-
-_chat_area()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
