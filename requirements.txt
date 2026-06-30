@@ -1,4 +1,6 @@
-gradio>=4.0
+flask>=3.0
+flask-cors>=4.0
+ollama>=0.2
 PyMuPDF>=1.24
 pdfplumber>=0.10
 sentence-transformers>=2.2
@@ -9,3 +11,5 @@ accelerate
 Pillow
 numpy
 huggingface_hub
+streamlit>=1.35
+requests

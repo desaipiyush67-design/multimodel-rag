@@ -1,35 +1,38 @@
+"""Minimal local SQLite logging module."""
+import os
 import sqlite3
-import datetime
+from datetime import datetime
 
-DB_NAME = "chat_history.db"
+DB_PATH = os.environ.get("CHAT_DB_PATH", "chat_logs.db")
+
 
 def init_db():
-    """Initializes the SQLite database and creates the chat_logs table."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS chat_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            pdf_name TEXT,
+            ts TEXT NOT NULL,
+            source TEXT,
             question TEXT,
             answer TEXT
         )
-    ''')
+        """
+    )
     conn.commit()
     conn.close()
 
-def log_chat(question, answer, pdf_name="Unknown"):
-    """Logs a single chat interaction to the database."""
+
+def log_chat(question: str, answer: str, source: str = "PDF Document"):
     try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        c.execute('''
-            INSERT INTO chat_logs (timestamp, pdf_name, question, answer)
-            VALUES (?, ?, ?, ?)
-        ''', (timestamp, pdf_name, question, answer))
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO chat_logs (ts, source, question, answer) VALUES (?, ?, ?, ?)",
+            (datetime.utcnow().isoformat(), source, question, answer),
+        )
         conn.commit()
         conn.close()
-    except:
-        pass # Silent fail to ensure chat continues even if DB errors occur
+    except Exception as e:
+        print(f"[db.log_chat] {e}")

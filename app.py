@@ -15,8 +15,37 @@ Endpoints and request/response shapes are identical, so the existing
 Streamlit frontend (frontend.py) works without any change.
 """
 
+# Windows MAX_PATH workaround: three files in transformers' audio_spectrogram_transformer
+# sub-package have paths > 260 chars and cannot be opened by Python's import machinery.
+# We inject lightweight stubs into sys.modules BEFORE any transformers import so the
+# lazy-import machinery never tries to open the missing files on disk.
+import sys as _sys
+import types as _types
+
+def _stub(name, **attrs):
+    m = _types.ModuleType(name)
+    for k, v in attrs.items():
+        setattr(m, k, v)
+    _sys.modules[name] = m
+
+_stub(
+    "transformers.models.audio_spectrogram_transformer.configuration_audio_spectrogram_transformer",
+    ASTConfig=type("ASTConfig", (), {"model_type": "audio-spectrogram-transformer"}),
+)
+_stub(
+    "transformers.models.audio_spectrogram_transformer.feature_extraction_audio_spectrogram_transformer",
+    ASTFeatureExtractor=type("ASTFeatureExtractor", (), {}),
+)
+_stub(
+    "transformers.models.audio_spectrogram_transformer.convert_audio_spectrogram_transformer_original_to_pytorch",
+)
+del _stub, _sys, _types
+
 import os
 import re
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub.file_download")
 import io
 import time
 import base64
@@ -25,6 +54,7 @@ import pickle
 import concurrent.futures
 import difflib
 import tempfile
+import threading
 import uuid
 from typing import List, Dict, Optional
 
@@ -59,8 +89,24 @@ class _NoopProgress:
 # =============================================================
 OLLAMA_MODEL = "qwen2.5:1.5b"
 CAPTION_MODEL = "Salesforce/blip-image-captioning-base"
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+def _local_model(hf_id, snapshot_sha):
+    """Return the local HF cache snapshot path if it exists, else the HF model ID."""
+    org, name = hf_id.split("/", 1)
+    path = os.path.join(
+        os.path.expanduser("~"), ".cache", "huggingface", "hub",
+        f"models--{org}--{name}", "snapshots", snapshot_sha,
+    )
+    return path if os.path.isdir(path) else hf_id
+
+EMBED_MODEL_NAME  = _local_model(
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+)
+RERANK_MODEL_NAME = _local_model(
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+)
 
 TOP_K_CHUNKS = 20
 RERANK_TOP_N = 12
@@ -77,15 +123,18 @@ _models = {}
 
 def _load_embed():
     print("[INIT] Loading Embedding Model ...")
-    return SentenceTransformer(EMBED_MODEL_NAME, device=DEVICE)
+    from sentence_transformers import models
+    word_embedding_model = models.Transformer(EMBED_MODEL_NAME, tokenizer_args={"use_fast": False})
+    pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension())
+    return SentenceTransformer(modules=[word_embedding_model, pooling_model], device=DEVICE)
 
 def _load_rerank():
     print("[INIT] Loading Reranker Model ...")
-    return CrossEncoder(RERANK_MODEL_NAME, device=DEVICE, max_length=384)
+    return CrossEncoder(RERANK_MODEL_NAME, device=DEVICE, max_length=384, tokenizer_args={"use_fast": False})
 
 def _load_blip():
     print("[INIT] Loading Local BLIP ...")
-    processor = BlipProcessor.from_pretrained(CAPTION_MODEL)
+    processor = BlipProcessor.from_pretrained(CAPTION_MODEL, use_fast=False)
     model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL).to(DEVICE)
     model.eval()
     return processor, model
@@ -998,6 +1047,36 @@ ENGINE = {
     "faq": ["", "", "", "", ""],
 }
 
+# --------- Background-job progress (for /process_pdf streaming) -----------
+# Single-user app, so one shared progress dict is fine.
+PROGRESS = {
+    "state":     "idle",     # idle | running | done | error
+    "percent":   0.0,
+    "desc":      "",
+    "job_id":    "",
+    "filename":  "",
+    "started_at": 0.0,
+    "result":    None,        # populated when state == "done"
+    "error":     None,        # populated when state == "error"
+}
+_PROGRESS_LOCK = threading.Lock()
+_PROCESS_THREAD = None
+
+
+def _make_progress_callable():
+    """Returns a callable that writes progress into PROGRESS so the
+    frontend's poller can show it."""
+    def _cb(pct=None, desc=None, **_):
+        with _PROGRESS_LOCK:
+            if pct is not None:
+                try:
+                    PROGRESS["percent"] = float(max(0.0, min(1.0, pct)))
+                except Exception:
+                    pass
+            if desc is not None:
+                PROGRESS["desc"] = str(desc)
+    return _cb
+
 
 def _build_engine_from_pdf(path: str, progress=_NoopProgress()):
     chunks, images = extract_pdf_comprehensive(path, progress)
@@ -1075,6 +1154,13 @@ def _run_startup_once():
     except Exception:
         pass
     _try_load_cache()
+    # Write PID file so process managers can track this server.
+    try:
+        pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".rag_backend.pid")
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
 
 
 # Run startup work exactly once, at import time, so it happens
@@ -1104,6 +1190,12 @@ def faq():
 
 @app.post("/process_pdf")
 def process_pdf():
+    """
+    Starts PDF processing in a background thread and returns immediately
+    with a job id. Poll GET /process_progress to track status.
+    """
+    global _PROCESS_THREAD
+
     if "file" not in request.files:
         return jsonify({"detail": "No file part named 'file' in the request."}), 400
     file = request.files["file"]
@@ -1112,36 +1204,87 @@ def process_pdf():
     if not file.filename.lower().endswith(".pdf"):
         return jsonify({"detail": "Only PDF files are accepted."}), 400
 
+    # Refuse to start a second job while one is already running.
+    with _PROGRESS_LOCK:
+        if PROGRESS["state"] == "running":
+            return jsonify({"detail": "Another PDF is already being processed.",
+                            "job_id": PROGRESS["job_id"]}), 409
+
+    # Save the upload to a temp file FIRST (sync), because Flask's request
+    # context vanishes the moment we return.
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    try:
-        file.save(tmp.name)
-        tmp.close()
-        chunks, images, embs, bm25, questions = _build_engine_from_pdf(tmp.name)
-        ENGINE["chunks"] = chunks
-        ENGINE["images"] = images
-        ENGINE["embs"] = embs
-        ENGINE["bm25"] = bm25
-        ENGINE["status"] = "✅ Engine Ready"
-        ENGINE["badge"] = "✔️ Active"
-        ENGINE["faq"] = questions
-        return jsonify({
-            "status": ENGINE["status"],
-            "badge": ENGINE["badge"],
-            "n_chunks": len(chunks),
-            "n_images": len(images),
-            "faq": questions,
-            "message": f"✅ **System Initialized!** Indexed {len(chunks)} chunks and {len(images)} visuals.",
+    file.save(tmp.name)
+    tmp.close()
+    filename = file.filename
+
+    job_id = uuid.uuid4().hex[:12]
+    with _PROGRESS_LOCK:
+        PROGRESS.update({
+            "state":   "running",
+            "percent": 0.0,
+            "desc":    "Queued...",
+            "job_id":  job_id,
+            "filename": filename,
+            "result":  None,
+            "error":   None,
+            "started_at": time.time(),
         })
-    except Exception as e:
-        traceback.print_exc()
-        ENGINE["status"] = f"❌ Error: {e}"
-        ENGINE["badge"] = "❌ Error"
-        return jsonify({"detail": str(e)}), 500
-    finally:
+
+    def _worker():
         try:
-            os.remove(tmp.name)
-        except Exception:
-            pass
+            chunks, images, embs, bm25, questions = _build_engine_from_pdf(
+                tmp.name, progress=_make_progress_callable()
+            )
+            ENGINE["chunks"] = chunks
+            ENGINE["images"] = images
+            ENGINE["embs"]   = embs
+            ENGINE["bm25"]   = bm25
+            ENGINE["status"] = "✅ Engine Ready"
+            ENGINE["badge"]  = "✔️ Active"
+            ENGINE["faq"]    = questions
+            result = {
+                "status": ENGINE["status"],
+                "badge":  ENGINE["badge"],
+                "n_chunks": len(chunks),
+                "n_images": len(images),
+                "faq": questions,
+                "message": f"✅ **System Initialized!** Indexed {len(chunks)} chunks and {len(images)} visuals.",
+            }
+            with _PROGRESS_LOCK:
+                PROGRESS.update({
+                    "state": "done",
+                    "percent": 1.0,
+                    "desc": "Complete",
+                    "result": result,
+                })
+        except Exception as e:
+            traceback.print_exc()
+            ENGINE["status"] = f"❌ Error: {e}"
+            ENGINE["badge"]  = "❌ Error"
+            with _PROGRESS_LOCK:
+                PROGRESS.update({
+                    "state": "error",
+                    "desc": f"Error: {e}",
+                    "error": str(e),
+                })
+        finally:
+            try:
+                os.remove(tmp.name)
+            except Exception:
+                pass
+
+    _PROCESS_THREAD = threading.Thread(target=_worker, daemon=True)
+    _PROCESS_THREAD.start()
+
+    return jsonify({"job_id": job_id, "state": "running"}), 202
+
+
+@app.get("/process_progress")
+def process_progress():
+    """Returns the current progress for the active (or last completed) job."""
+    with _PROGRESS_LOCK:
+        snap = dict(PROGRESS)
+    return jsonify(snap)
 
 
 @app.post("/chat")
